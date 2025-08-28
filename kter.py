@@ -2,6 +2,7 @@
 A kubernetes control panel.
 """
 
+import json
 from typing import Any
 from textual.coordinate import Coordinate
 from textual.app import App, ComposeResult
@@ -15,6 +16,7 @@ from textual.containers import VerticalScroll
 
 from kubernetes import client, config
 from kubernetes.client.models.v1_pod import V1Pod
+from kubernetes.client import ApiException
 
 
 class KubeInterface:
@@ -34,8 +36,8 @@ class KubeInterface:
     def get_pod(self, name: str, namespace: str) -> V1Pod:
         return self.api.read_namespaced_pod(name, namespace)
 
-    def get_pod_logs(self, name: str, namespace: str):
-        return self.api.read_namespaced_pod_log(name, namespace)
+    def get_pod_logs(self, name: str, namespace: str, container=None):
+        return self.api.read_namespaced_pod_log(name, namespace, container=container)
 
     def get_contexts(self) -> list[dict[str, str]]:
         # As far as I can tell just returns a 2-tuple of (all contexts, current context)
@@ -50,6 +52,8 @@ class NamespaceSelectScreen(ModalScreen[str]):
     """Screen with a dialog select your namespace."""
 
     ALL_NAMESPACES_IDENTIFIER = "all"
+
+    BINDINGS = [("escape", "app.pop_screen", "Exit")]
 
     def __init__(self, kube: KubeInterface, *args, **kwargs):
         self.kube = kube
@@ -67,6 +71,8 @@ class NamespaceSelectScreen(ModalScreen[str]):
 
 class KubeContextSelectScreen(ModalScreen[str]):
     """Screen with a dialog select your kube context."""
+
+    BINDINGS = [("escape", "app.pop_screen", "Exit")]
 
     def __init__(self, kube: KubeInterface, *args, **kwargs):
         self.kube = kube
@@ -112,15 +118,20 @@ class PodLogScreen(Screen):
         super().__init__(*args, **kwargs)
 
     def compose(self) -> ComposeResult:
-        scroll = VerticalScroll(
-            Static(
-                self.kube.get_pod_logs(self.pod_name, self.pod_namespace),
-                markup=False,
+        try:
+            scroll = VerticalScroll(
+                Static(
+                    self.kube.get_pod_logs(self.pod_name, self.pod_namespace),
+                    markup=False,
+                )
             )
-        )
-        scroll.anchor()
-        yield scroll
-        yield Footer()
+            scroll.anchor()
+            yield scroll
+            yield Footer()
+        except ApiException as e:
+            # there's some weird loading going on here but apparently this exists
+            app.notify(title=f"{e.status} {e.reason}", message=e.body, severity="error")
+            app.pop_screen()
 
 
 class PodTable(DataTable):
@@ -140,6 +151,7 @@ class PodTable(DataTable):
         pod_table_key_list = [
             "namespace",
             "name",
+            "ready",
             "status",
         ]
         selected = self.cursor_row
@@ -159,10 +171,18 @@ class PodTable(DataTable):
         # TODO do a name search for this so it's 1. the same pod 2. if that doesn't exist the old cursor index 3. if that doesn't exist the last row
         self.move_cursor(row=selected)
 
+    def pod_readiness(self, pod):
+        if pod.status.container_statuses is None:
+            return "0/0"
+        container_count = len(pod.status.container_statuses)
+        ready_count = len([p for p in pod.status.container_statuses if p.ready])
+        return f"{ready_count}/{container_count}"
+
     def pod_item(self, pod, include_namespace: bool = True) -> list[str]:
         item: list[str] = [
             pod.metadata.namespace,
             pod.metadata.name,
+            self.pod_readiness(pod),
             pod.status.phase,
         ]
         if not include_namespace:
