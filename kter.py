@@ -3,6 +3,8 @@ A kubernetes control panel.
 """
 
 import json
+
+from rich.pretty import pprint
 from typing import Any
 from textual.coordinate import Coordinate
 from textual.app import App, ComposeResult
@@ -110,6 +112,49 @@ class PodLogScreen(Screen):
     BINDINGS = [("escape", "app.pop_screen", "Exit")]
 
     def __init__(
+        self,
+        pod_name: str,
+        pod_namespace: str,
+        kube: KubeInterface,
+        *args,
+        container_name=None,
+        **kwargs,
+    ):
+        self.pod_name = pod_name
+        self.pod_namespace = pod_namespace
+        self.kube = kube
+        self.container_name = container_name
+        super().__init__(*args, **kwargs)
+
+    def compose(self) -> ComposeResult:
+
+        try:
+            scroll = VerticalScroll(
+                Static(
+                    self.kube.get_pod_logs(
+                        self.pod_name, self.pod_namespace, self.container_name
+                    ),
+                    markup=False,
+                )
+            )
+            scroll.anchor()
+            yield scroll
+            yield Footer()
+        except ApiException as e:
+            # there's some weird loading going on here but apparently this exists
+            app.notify(
+                title=f"{e.status} {e.reason}",
+                message=e.body,
+                severity="error",
+            )
+            self.dismiss()
+
+
+class PodLogContainerSelectScreen(ModalScreen[str | None]):
+
+    BINDINGS = [("escape", "app.pop_screen", "Exit")]
+
+    def __init__(
         self, pod_name: str, pod_namespace: str, kube: KubeInterface, *args, **kwargs
     ):
         self.pod_name = pod_name
@@ -119,19 +164,18 @@ class PodLogScreen(Screen):
 
     def compose(self) -> ComposeResult:
         try:
-            scroll = VerticalScroll(
-                Static(
-                    self.kube.get_pod_logs(self.pod_name, self.pod_namespace),
-                    markup=False,
-                )
-            )
-            scroll.anchor()
-            yield scroll
-            yield Footer()
+            pod = self.kube.get_pod(self.pod_name, self.pod_namespace)
         except ApiException as e:
-            # there's some weird loading going on here but apparently this exists
             app.notify(title=f"{e.status} {e.reason}", message=e.body, severity="error")
-            app.pop_screen()
+            app.pop_screen()  # don't trigger dismiss stuff
+        if len(pod.spec.containers) == 1:
+            self.dismiss()
+        else:
+            yield OptionList(*[c.name for c in pod.spec.containers])
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        prompt = event.option._prompt
+        self.dismiss(prompt)
 
 
 class PodTable(DataTable):
@@ -265,7 +309,15 @@ class KTer(App):
         name = self.pod_table.get_cell_at(
             Coordinate(row=row_i, column=self.pod_table.get_column_index("name"))
         )
-        self.push_screen(PodLogScreen(name, ns, self.kube))
+
+        def push_log_screen(container_name: str | None):
+            self.push_screen(
+                PodLogScreen(name, ns, self.kube, container_name=container_name)
+            )
+
+        self.push_screen(
+            PodLogContainerSelectScreen(name, ns, self.kube), push_log_screen
+        )
 
     def on_data_table_row_selected(self, event: PodTable.RowSelected) -> None:
         name = event.data_table.get_cell_at(
