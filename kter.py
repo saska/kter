@@ -2,10 +2,12 @@
 A kubernetes control panel.
 """
 
+from typing import Any
 from textual.coordinate import Coordinate
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import DataTable, Header, Footer, OptionList, Pretty, Static
+from textual.widgets.option_list import Option
 from textual.screen import ModalScreen, Screen
 from textual.widgets.data_table import ColumnDoesNotExist, CellDoesNotExist
 
@@ -35,6 +37,14 @@ class KubeInterface:
     def get_pod_logs(self, name: str, namespace: str):
         return self.api.read_namespaced_pod_log(name, namespace)
 
+    def get_contexts(self) -> list[dict[str, str]]:
+        # As far as I can tell just returns a 2-tuple of (all contexts, current context)
+        return config.list_kube_config_contexts()[0]
+
+    def set_context(self, context: str) -> None:
+        config.load_config(context=context)
+        self.api = client.CoreV1Api()
+
 
 class NamespaceSelectScreen(ModalScreen[str]):
     """Screen with a dialog select your namespace."""
@@ -52,6 +62,23 @@ class NamespaceSelectScreen(ModalScreen[str]):
         prompt = event.option._prompt
         if prompt == self.ALL_NAMESPACES_IDENTIFIER:
             self.dismiss(None)
+        self.dismiss(prompt)
+
+
+class KubeContextSelectScreen(ModalScreen[str]):
+    """Screen with a dialog select your kube context."""
+
+    def __init__(self, kube: KubeInterface, *args, **kwargs):
+        self.kube = kube
+        self.contexts = {}
+        super().__init__(*args, **kwargs)
+
+    def compose(self) -> ComposeResult:
+        contexts = self.kube.get_contexts()
+        yield OptionList(*[c["name"] for c in contexts])
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        prompt = event.option._prompt
         self.dismiss(prompt)
 
 
@@ -151,9 +178,15 @@ class KTer(App):
 
     BINDINGS = [
         Binding(
+            "c",
+            "select_context",
+            "context",
+            tooltip="Select your kubernetes context",
+        ),
+        Binding(
             "n",
             "select_namespace",
-            "Select namespace",
+            "namespace",
             tooltip="Select namespace",
         ),
         Binding(
@@ -191,6 +224,13 @@ class KTer(App):
             self._update()
 
         self.push_screen(NamespaceSelectScreen(self.kube), set_namespace)
+
+    def action_select_context(self) -> None:
+        def set_context(context: str | None) -> None:
+            self.kube.set_context(context)
+            self._update()
+
+        self.push_screen(KubeContextSelectScreen(self.kube), set_context)
 
     def action_logs(self) -> None:
         row_i = self.pod_table.cursor_row
