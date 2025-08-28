@@ -2,15 +2,10 @@
 A kubernetes control panel.
 """
 
-import json
-
-from rich.pretty import pprint
-from typing import Any
 from textual.coordinate import Coordinate
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import DataTable, Header, Footer, OptionList, Pretty, Static
-from textual.widgets.option_list import Option
 from textual.screen import ModalScreen, Screen
 from textual.widgets.data_table import ColumnDoesNotExist, CellDoesNotExist
 
