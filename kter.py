@@ -2,6 +2,8 @@
 A kubernetes control panel.
 """
 
+import asyncio
+
 from textual.coordinate import Coordinate
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -21,11 +23,16 @@ class KubeInterface:
         config.load_kube_config()
         self.api = client.CoreV1Api()
 
-    def get_pods(self, namespace=None):
+    async def get_pods(self, namespace=None):
         if namespace is None:
-            return self.api.list_pod_for_all_namespaces(watch=False).items
+            pods = await asyncio.to_thread(self.api.list_pod_for_all_namespaces)
+            return pods.items
         else:
-            return self.api.list_namespaced_pod(namespace).items
+            pods = await asyncio.to_thread(
+                self.api.list_namespaced_pod,
+                namespace,
+            )
+            return pods.items
 
     def get_namespaces(self):
         return [n.metadata.name for n in self.api.list_namespace(watch=False).items]
@@ -176,38 +183,85 @@ class PodLogContainerSelectScreen(ModalScreen[str | None]):
 class PodTable(DataTable):
     def __init__(self, kube: KubeInterface, *args, **kwargs):
         self.kube = kube
+        self.previously_namespaced = False
         super().__init__(*args, **kwargs)
 
     def on_mount(self) -> None:
         self.cursor_type = "row"
         self.update_pods()
 
-    def update_pods(self, namespace: str | None = None) -> None:
-        pods = [
-            self.pod_item(pod, include_namespace=(namespace is None))
-            for pod in self.kube.get_pods(namespace=namespace)
-        ]
+    async def update_pods(self, namespace: str | None = None) -> None:
+        """Update the pods in the pod table.
+
+        The reason this is so convoluted instead of emptying it out and just
+        re-drawing the entire thing is that if you have a vertical scrollbar
+        and are not at the top of the list it bounces around annoyingly on each
+        update so we do it the hard way.
+        """
+        pods = await self.kube.get_pods(namespace=namespace)
+
         pod_table_key_list = [
             "namespace",
             "name",
             "ready",
             "status",
         ]
+
+        # Have to force complete redraw if we want to re-add
+        # namespace to the table as I can't find a clear way
+        # to add a column to the left side of the table
+        if namespace is not None:
+            self.previously_namespaced = True
+        if namespace is None and self.previously_namespaced:
+            self.clear()
+            for key in pod_table_key_list:
+                try:
+                    self.remove_column(key)
+                except ColumnDoesNotExist:
+                    pass
+            self.previously_namespaced = False
+
+        new_rows = {
+            f"{p.metadata.namespace}.{p.metadata.name}": self.pod_item(
+                p, include_namespace=(namespace is None)
+            )
+            for p in pods
+        }
+
         selected = self.cursor_row
-        for k in pod_table_key_list:
-            try:
-                self.remove_column(k)
-            except ColumnDoesNotExist:
-                pass
+
         if namespace is not None:
             pod_table_key_list.pop(0)
+            try:
+                self.remove_column("namespace")
+            except ColumnDoesNotExist:
+                pass
+
         for p in pod_table_key_list:
-            self.add_column(p, key=p)
-        self.clear()
-        self.add_rows(pods)
+            try:
+                # get index since get_column returns an iterator
+                self.get_column_index(p)
+            except ColumnDoesNotExist:
+                self.add_column(p, key=p)
+
+        deletes = []
+        for row in self.rows:
+            if row.value in new_rows:
+                *_, ready, status = new_rows.pop(row.value)
+                self.update_cell(row, "ready", ready)
+                self.update_cell(row, "status", status)
+            else:
+                deletes.append(row)
+
+        for d in deletes:
+            self.remove_row(d)
+
+        for key, row in new_rows.items():
+            self.add_row(*row, key=key)
         self.sort(*pod_table_key_list)
         selected = min(selected, len(self.rows))
         # TODO do a name search for this so it's 1. the same pod 2. if that doesn't exist the old cursor index 3. if that doesn't exist the last row
+        # Easy if this gets merged https://github.com/Textualize/textual/pull/6081
         self.move_cursor(row=selected)
 
     def pod_readiness(self, pod):
@@ -270,17 +324,17 @@ class KTer(App):
         yield self.pod_table
         yield Footer()
 
-    def _update(self) -> None:
-        self.pod_table.update_pods(namespace=self.namespace)
+    async def _update(self) -> None:
+        await self.pod_table.update_pods(namespace=self.namespace)
 
-    def on_ready(self) -> None:
-        self._update()
+    async def on_ready(self) -> None:
+        await self._update()
         self.set_interval(1, self._update)
 
     def action_select_namespace(self) -> None:
-        def set_namespace(ns: str | None) -> None:
+        async def set_namespace(ns: str | None) -> None:
             self.namespace = ns
-            self._update()
+            await self._update()
 
         self.push_screen(NamespaceSelectScreen(self.kube), set_namespace)
 
