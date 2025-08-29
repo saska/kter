@@ -3,11 +3,12 @@ A kubernetes control panel.
 """
 
 import asyncio
+import re
 
 from textual.coordinate import Coordinate
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import DataTable, Header, Footer, OptionList, Pretty, Static
+from textual.widgets import DataTable, Header, Footer, OptionList, Pretty, Static, Input
 from textual.screen import ModalScreen, Screen
 from textual.widgets.data_table import ColumnDoesNotExist, CellDoesNotExist
 
@@ -40,8 +41,10 @@ class KubeInterface:
     def get_pod(self, name: str, namespace: str) -> V1Pod:
         return self.api.read_namespaced_pod(name, namespace)
 
-    def get_pod_logs(self, name: str, namespace: str, container=None):
-        return self.api.read_namespaced_pod_log(name, namespace, container=container)
+    async def get_pod_logs(self, name: str, namespace: str, container=None):
+        return await asyncio.to_thread(
+            self.api.read_namespaced_pod_log, name, namespace, container=container
+        )
 
     def get_contexts(self) -> list[dict[str, str]]:
         # As far as I can tell just returns a 2-tuple of (all contexts, current context)
@@ -110,8 +113,86 @@ class PodSummaryScreen(Screen):
         yield Footer()
 
 
-class PodLogScreen(Screen):
+class StaticPodLogViewer(Static):
+    # TODO add streaming
+    def __init__(
+        self,
+        pod_name: str,
+        pod_namespace: str,
+        kube: KubeInterface,
+        *args,
+        container_name: str | None = None,
+        **kwargs,
+    ):
+        self.pod_name = pod_name
+        self.pod_namespace = pod_namespace
+        self.kube = kube
+        self.container_name = container_name
+        self.log_ = ""
+        self.regex = None
+        super().__init__(
+            *args,
+            markup=False,
+            **kwargs,
+        )
+
+    async def on_mount(self):
+        try:
+            self.log_ = await self.kube.get_pod_logs(
+                self.pod_name, self.pod_namespace, container=self.container_name
+            )
+        except ApiException as e:
+            # there's some weird loading going on here but apparently this exists
+            # also ugly to do it from the widget instead of the screen I guess
+            # but whatchagonnado, fix it?
+            app.notify(
+                title=f"{e.status} {e.reason}",
+                message=e.body,
+                severity="error",
+            )
+            app.pop_screen()
+
+        self.update(content=self.log_)
+
+    def update_with_regex(self, regex):
+        self.regex = regex
+        content_lines = [
+            line for line in self.log_.split("\n") if re.search(regex, line)
+        ]
+        self.update(content="\n".join(content_lines))
+
+    def update_clear_regex(self):
+        self.regex = None
+        self.update(content=self.log_)
+
+    async def refresh_logs(self):
+        self.log_ = await self.kube.get_pod_logs(
+            self.pod_name, self.pod_namespace, container=self.container_name
+        )
+        if self.regex is not None:
+            self.update_with_regex(self.regex)
+        else:
+            self.update_clear_regex()
+
+
+class PodLogRegexFilterScreen(ModalScreen[str | None]):
+
     BINDINGS = [("escape", "app.pop_screen", "Exit")]
+
+    def compose(self) -> ComposeResult:
+        yield Input()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+
+class PodLogScreen(Screen):
+    BINDINGS = [
+        ("escape", "app.pop_screen", "Exit"),
+        ("r", "refresh_logs", "refresh"),
+        ("g", "regex_filter", "regex"),
+        ("ctrl+g", "clear_regex", "clear regex"),
+    ]
 
     def __init__(
         self,
@@ -126,30 +207,32 @@ class PodLogScreen(Screen):
         self.pod_namespace = pod_namespace
         self.kube = kube
         self.container_name = container_name
+        self.static = None
         super().__init__(*args, **kwargs)
 
     def compose(self) -> ComposeResult:
+        self.static = StaticPodLogViewer(
+            self.pod_name,
+            self.pod_namespace,
+            self.kube,
+            container_name=self.container_name,
+        )
+        scroll = VerticalScroll(self.static)
+        scroll.anchor()
+        yield scroll
+        yield Footer()
 
-        try:
-            scroll = VerticalScroll(
-                Static(
-                    self.kube.get_pod_logs(
-                        self.pod_name, self.pod_namespace, self.container_name
-                    ),
-                    markup=False,
-                )
-            )
-            scroll.anchor()
-            yield scroll
-            yield Footer()
-        except ApiException as e:
-            # there's some weird loading going on here but apparently this exists
-            app.notify(
-                title=f"{e.status} {e.reason}",
-                message=e.body,
-                severity="error",
-            )
-            self.dismiss()
+    def action_regex_filter(self):
+        def regex_filter(regex: str | None) -> None:
+            self.static.update_with_regex(regex)
+
+        app.push_screen(PodLogRegexFilterScreen(), regex_filter)
+
+    def action_clear_regex(self):
+        self.static.update_clear_regex()
+
+    async def action_refresh_logs(self):
+        await self.static.refresh_logs()
 
 
 class PodLogContainerSelectScreen(ModalScreen[str | None]):
