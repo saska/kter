@@ -186,9 +186,9 @@ class PodTable(DataTable):
         self.previously_namespaced = False
         super().__init__(*args, **kwargs)
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self.cursor_type = "row"
-        self.update_pods()
+        await self.update_pods()
 
     async def update_pods(self, namespace: str | None = None) -> None:
         """Update the pods in the pod table.
@@ -271,12 +271,19 @@ class PodTable(DataTable):
         ready_count = len([p for p in pod.status.container_statuses if p.ready])
         return f"{ready_count}/{container_count}"
 
+    def pod_status(self, pod):
+        container_statuses = pod.status.container_statuses
+        for c in container_statuses:
+            if c.state.waiting is not None:
+                return c.state.waiting.reason
+        return pod.status.phase
+
     def pod_item(self, pod, include_namespace: bool = True) -> list[str]:
         item: list[str] = [
             pod.metadata.namespace,
             pod.metadata.name,
             self.pod_readiness(pod),
-            pod.status.phase,
+            self.pod_status(pod),
         ]
         if not include_namespace:
             item.pop(0)
